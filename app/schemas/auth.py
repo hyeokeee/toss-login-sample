@@ -113,3 +113,70 @@ class LogoutResponse(BaseModel):
     success: bool = True
     message: str = "로그아웃 완료"
 
+
+# === 서비스 자체 JWT 토큰 스키마 ===
+
+
+class ServiceTokenResponse(BaseModel):
+    """
+    서비스 자체 JWT 토큰 응답
+
+    토스 OAuth 토큰과 별개로, 서비스 내부 인증에 사용되는 JWT 토큰입니다.
+    """
+
+    access_token: str = Field(..., description="서비스 JWT 액세스 토큰")
+    refresh_token: str = Field(..., description="서비스 JWT 리프레시 토큰")
+    token_type: str = Field(default="Bearer", description="토큰 타입")
+    expires_in: int = Field(..., description="액세스 토큰 만료 시간(초)")
+
+
+class LoginResponse(BaseModel):
+    """
+    로그인 성공 응답
+
+    토스 로그인 완료 후 반환되는 응답입니다.
+    서비스 자체 JWT 토큰과 사용자 정보를 포함합니다.
+    """
+
+    success: bool = True
+    message: str = "로그인 성공"
+    token: ServiceTokenResponse = Field(..., description="서비스 JWT 토큰")
+    user: TossUserInfo = Field(..., description="토스 사용자 정보")
+
+
+class RefreshTokenRequest(BaseModel):
+    """토큰 갱신 요청"""
+
+    refresh_token: str = Field(..., description="리프레시 토큰")
+
+
+class RefreshTokenResponse(BaseModel):
+    """토큰 갱신 응답"""
+
+    success: bool = True
+    access_token: str = Field(..., description="새 액세스 토큰")
+    token_type: str = Field(default="Bearer", description="토큰 타입")
+    expires_in: int = Field(..., description="만료 시간(초)")
+
+
+# === 현재 사용자 스키마 (미들웨어에서 사용) ===
+
+
+class CurrentUser(BaseModel):
+    """
+    현재 로그인한 사용자 정보
+
+    JWT 토큰에서 추출한 사용자 정보입니다.
+    인증 미들웨어에서 주입됩니다.
+    """
+
+    user_key: str = Field(..., description="토스 사용자 고유 식별자")
+    name: Optional[str] = Field(None, description="이름")
+    email: Optional[str] = Field(None, description="이메일")
+
+
+class MeResponse(BaseModel):
+    """현재 사용자 정보 응답"""
+
+    success: bool = True
+    user: CurrentUser

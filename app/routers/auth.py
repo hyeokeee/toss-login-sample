@@ -3,16 +3,24 @@ from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
+from jose import JWTError
 
+from app.config import settings
+from app.middleware.auth import RequiredUser
 from app.schemas.auth import (
     ErrorResponse,
+    LoginResponse,
     LogoutResponse,
-    TokenResponse,
+    MeResponse,
+    RefreshTokenRequest,
+    RefreshTokenResponse,
+    ServiceTokenResponse,
     UnlinkCallbackRequest,
     UnlinkCallbackResponse,
     UnlinkReferrer,
     UserInfoResponse,
 )
+from app.services.jwt_handler import jwt_handler
 from app.services.toss_auth import toss_auth_service
 
 router = APIRouter()
@@ -46,13 +54,13 @@ async def authorize(
 
 @router.get(
     "/callback",
-    response_model=TokenResponse,
+    response_model=LoginResponse,
     responses={
         400: {"model": ErrorResponse, "description": "인가 코드 없음 또는 에러"},
         500: {"model": ErrorResponse, "description": "토큰 발급 실패"},
     },
     summary="토스 로그인 콜백",
-    description="토스에서 리다이렉트된 인가 코드를 받아 액세스 토큰을 발급합니다.",
+    description="토스에서 리다이렉트된 인가 코드를 받아 서비스 JWT 토큰을 발급합니다.",
 )
 async def callback(
     code: Optional[str] = Query(default=None, description="인가 코드"),
@@ -65,8 +73,10 @@ async def callback(
     """
     토스 로그인 콜백 처리
 
-    토스에서 리다이렉트된 요청을 처리하여 액세스 토큰을 발급합니다.
-    실제 서비스에서는 발급된 토큰을 안전하게 저장하고 세션을 생성해야 합니다.
+    토스에서 리다이렉트된 요청을 처리합니다:
+    1. 인가 코드로 토스 액세스 토큰 발급
+    2. 토스 액세스 토큰으로 사용자 정보 조회
+    3. 서비스 자체 JWT 토큰 발급
     """
     # 에러 응답 처리
     if error:
@@ -90,27 +100,128 @@ async def callback(
             },
         )
 
-    # TODO: state 값 검증 (세션에 저장된 값과 비교)
+    # TODO: state 값 검증 (세션/Redis에 저장된 값과 비교)
     # 실제 서비스에서는 authorize에서 생성한 state와 비교해야 합니다.
 
     try:
-        # 인가 코드로 토큰 발급
-        token_response = await toss_auth_service.exchange_code_for_token(code)
+        # 1. 인가 코드로 토스 액세스 토큰 발급
+        toss_token = await toss_auth_service.exchange_code_for_token(code)
 
-        # TODO: 토큰을 안전하게 저장 (DB, Redis 등)
-        # TODO: 사용자 세션 생성
+        # 2. 토스 액세스 토큰으로 사용자 정보 조회
+        user_info = await toss_auth_service.get_user_info(toss_token.access_token)
 
-        return token_response
+        # 3. 서비스 자체 JWT 토큰 발급
+        # 토스 사용자 정보를 JWT에 포함
+        additional_claims = {
+            "name": user_info.name,
+            "email": user_info.email,
+            # 토스 액세스 토큰도 저장 (필요시 토스 API 호출용)
+            "toss_access_token": toss_token.access_token,
+        }
+
+        service_access_token = jwt_handler.create_access_token(
+            user_key=user_info.user_key,
+            additional_claims=additional_claims,
+        )
+        service_refresh_token = jwt_handler.create_refresh_token(
+            user_key=user_info.user_key,
+        )
+
+        # TODO: 리프레시 토큰을 DB/Redis에 저장 (토큰 무효화용)
+
+        return LoginResponse(
+            success=True,
+            message="로그인 성공",
+            token=ServiceTokenResponse(
+                access_token=service_access_token,
+                refresh_token=service_refresh_token,
+                token_type="Bearer",
+                expires_in=settings.jwt_access_token_expire_minutes * 60,
+            ),
+            user=user_info,
+        )
 
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
                 "success": False,
-                "errorCode": "TOKEN_EXCHANGE_FAILED",
-                "errorMessage": f"토큰 발급에 실패했습니다: {str(e)}",
+                "errorCode": "LOGIN_FAILED",
+                "errorMessage": f"로그인에 실패했습니다: {str(e)}",
             },
         )
+
+
+@router.post(
+    "/refresh",
+    response_model=RefreshTokenResponse,
+    responses={
+        401: {"model": ErrorResponse, "description": "유효하지 않은 리프레시 토큰"},
+    },
+    summary="토큰 갱신",
+    description="리프레시 토큰으로 새 액세스 토큰을 발급합니다.",
+)
+async def refresh_token(request: RefreshTokenRequest):
+    """
+    액세스 토큰 갱신
+
+    리프레시 토큰을 검증하고 새 액세스 토큰을 발급합니다.
+    """
+    try:
+        # 리프레시 토큰 검증
+        payload = jwt_handler.verify_refresh_token(request.refresh_token)
+        user_key = payload.get("sub")
+
+        if not user_key:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={
+                    "success": False,
+                    "errorCode": "INVALID_TOKEN",
+                    "errorMessage": "유효하지 않은 리프레시 토큰입니다.",
+                },
+            )
+
+        # TODO: DB/Redis에서 리프레시 토큰 유효성 확인 (블랙리스트 체크)
+
+        # 새 액세스 토큰 발급
+        new_access_token = jwt_handler.create_access_token(user_key=user_key)
+
+        return RefreshTokenResponse(
+            success=True,
+            access_token=new_access_token,
+            token_type="Bearer",
+            expires_in=settings.jwt_access_token_expire_minutes * 60,
+        )
+
+    except JWTError as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "success": False,
+                "errorCode": "INVALID_TOKEN",
+                "errorMessage": f"토큰 검증에 실패했습니다: {str(e)}",
+            },
+        )
+
+
+@router.get(
+    "/me",
+    response_model=MeResponse,
+    responses={
+        401: {"model": ErrorResponse, "description": "인증 필요"},
+    },
+    summary="현재 사용자 정보",
+    description="JWT 토큰에서 현재 로그인한 사용자 정보를 반환합니다.",
+)
+async def get_me(current_user: RequiredUser):
+    """
+    현재 로그인한 사용자 정보 조회
+
+    JWT 토큰을 검증하고 토큰에 저장된 사용자 정보를 반환합니다.
+    인증 미들웨어를 통해 자동으로 사용자 정보가 주입됩니다.
+    """
+    return MeResponse(success=True, user=current_user)
 
 
 @router.get(
@@ -167,15 +278,44 @@ async def get_user_info(
         500: {"model": ErrorResponse, "description": "로그아웃 실패"},
     },
     summary="로그아웃",
-    description="토스 로그인 세션을 종료하고 토큰을 무효화합니다.",
+    description="서비스 세션을 종료합니다.",
 )
-async def logout(
-    authorization: str = Header(..., description="Bearer 액세스 토큰"),
-):
+async def logout(current_user: RequiredUser):
     """
     로그아웃 처리
 
-    토스 서버에 토큰 무효화를 요청하고 서비스 세션을 종료합니다.
+    서비스 JWT 토큰을 무효화합니다.
+    토스 서버 로그아웃은 별도로 처리해야 합니다.
+
+    Note:
+        - JWT는 stateless이므로 완전한 무효화를 위해서는
+          블랙리스트 방식 또는 토큰 버전 관리가 필요합니다.
+        - 토스 서버 로그아웃이 필요하면 /logout/toss 엔드포인트를 사용하세요.
+    """
+    # TODO: 리프레시 토큰을 DB/Redis에서 삭제 (블랙리스트 추가)
+    # TODO: 필요시 토스 서버에도 로그아웃 요청
+
+    return LogoutResponse(success=True, message=f"로그아웃이 완료되었습니다. (user: {current_user.user_key})")
+
+
+@router.post(
+    "/logout/toss",
+    response_model=LogoutResponse,
+    responses={
+        401: {"model": ErrorResponse, "description": "인증 필요"},
+        500: {"model": ErrorResponse, "description": "로그아웃 실패"},
+    },
+    summary="토스 서버 로그아웃",
+    description="토스 서버에 로그아웃을 요청하여 토스 토큰을 무효화합니다.",
+)
+async def logout_toss(
+    authorization: str = Header(..., description="Bearer 토스 액세스 토큰"),
+):
+    """
+    토스 서버 로그아웃 처리
+
+    토스 서버에 토큰 무효화를 요청합니다.
+    이 엔드포인트는 토스 액세스 토큰이 필요합니다.
     """
     if not authorization.startswith("Bearer "):
         raise HTTPException(
@@ -187,15 +327,11 @@ async def logout(
             },
         )
 
-    access_token = authorization[7:]
+    toss_access_token = authorization[7:]
 
     try:
-        await toss_auth_service.logout(access_token)
-
-        # TODO: 서비스 세션 삭제
-        # TODO: 저장된 토큰 삭제
-
-        return LogoutResponse(success=True, message="로그아웃이 완료되었습니다.")
+        await toss_auth_service.logout(toss_access_token)
+        return LogoutResponse(success=True, message="토스 로그아웃이 완료되었습니다.")
 
     except Exception as e:
         raise HTTPException(
@@ -203,7 +339,7 @@ async def logout(
             detail={
                 "success": False,
                 "errorCode": "LOGOUT_FAILED",
-                "errorMessage": f"로그아웃에 실패했습니다: {str(e)}",
+                "errorMessage": f"토스 로그아웃에 실패했습니다: {str(e)}",
             },
         )
 
