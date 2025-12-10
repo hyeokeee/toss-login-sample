@@ -112,3 +112,6 @@ async def get_current_user_optional(
 RequiredUser = Annotated[CurrentUser, Depends(get_current_user)]
 OptionalUser = Annotated[Optional[CurrentUser], Depends(get_current_user_optional)]
 
+
+
+
