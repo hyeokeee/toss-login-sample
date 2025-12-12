@@ -202,3 +202,6 @@ FastAPI 의존성 주입을 통한 인증 미들웨어입니다.
 - [콘솔 가이드](https://developers-apps-in-toss.toss.im/login/console.html)
 - [개발하기](https://developers-apps-in-toss.toss.im/login/develop.html)
 - [QA 진행하기](https://developers-apps-in-toss.toss.im/login/qa.html)
+
+
+[x]
